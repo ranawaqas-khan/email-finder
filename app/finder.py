@@ -1,127 +1,120 @@
 # app/finder.py
-"""
-Email Finder API
-----------------
-Generates common email address patterns from a full name and domain,
-then verifies them using the same verification logic as bounsov2/verifier.py.
-
-Order of verification (stops when first valid email is found):
-    first@domain
-    last@domain
-    f.last@domain
-    first.last@domain
-    first.l@domain
-    firstlast@domain
-    lastfirst@domain
-    fl@domain
-"""
-
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Optional
-from app.verifier import verify_email
+from typing import Optional, List
 import asyncio
 import re
 import logging
 
-# ---------------------------
-# FastAPI App Setup
-# ---------------------------
+from app.verifier import verify_email  # same logic you already have
+
 app = FastAPI(
     title="Email Finder",
     version="1.0.0",
-    description="Generates possible email patterns and verifies them using SMTP logic.",
+    description="Generates email patterns and verifies sequentially; returns first valid only."
 )
 
-# ---------------------------
-# Logging Setup
-# ---------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("email_finder")
+
 
 # ---------------------------
-# Request/Response Models
+# Models
 # ---------------------------
 class FindRequest(BaseModel):
     full_name: str
     domain: str
 
+
 class FindResponse(BaseModel):
     found: Optional[str]
 
+
 # ---------------------------
-# Pattern Generator
+# Helpers
 # ---------------------------
-def generate_patterns(full_name: str, domain: str):
-    """
-    Generate and return email patterns in defined order.
-    """
-    full_name = re.sub(r"[^a-zA-Z\s]", "", full_name).lower().strip()
-    parts = full_name.split()
+NAME_CLEAN_RE = re.compile(r"[^a-zA-Z\s]+")
+DOMAIN_CLEAN_RE = re.compile(r"[^a-z0-9.\-]")
+
+def clean_name(name: str) -> List[str]:
+    """Keep letters and spaces, split into tokens, lowercase."""
+    cleaned = NAME_CLEAN_RE.sub("", name or "").strip().lower()
+    parts = [p for p in cleaned.split() if p]
+    return parts
+
+def clean_domain(domain: str) -> str:
+    """Lowercase, drop leading @, remove illegal characters."""
+    d = (domain or "").strip().lower()
+    if d.startswith("@"):
+        d = d[1:]
+    # strip anything not allowed in a basic domain string
+    d = DOMAIN_CLEAN_RE.sub("", d)
+    if "." not in d or not d:
+        raise HTTPException(status_code=400, detail="Invalid domain")
+    return d
+
+def generate_patterns(full_name: str, domain: str) -> List[str]:
+    """Exactly the 8 patterns in the specified order, deduped, skipping ones that need a missing last name."""
+    parts = clean_name(full_name)
     if not parts:
         return []
-
     first = parts[0]
     last = parts[-1] if len(parts) > 1 else ""
     fi = first[0] if first else ""
     li = last[0] if last else ""
 
+    # Required order:
     patterns = [
-        f"{first}@{domain}",          # first
-        f"{last}@{domain}",           # last
-        f"{fi}.{last}@{domain}",      # f.last
-        f"{first}.{last}@{domain}",   # first.last
-        f"{first}.{li}@{domain}",     # first.l
-        f"{first}{last}@{domain}",    # firstlast
-        f"{last}{first}@{domain}",    # lastfirst
-        f"{fi}{li}@{domain}",         # fl
+        f"{first}@{domain}",                                   # first@domain
+        *( [f"{last}@{domain}"] if last else [] ),            # last@domain
+        *( [f"{fi}.{last}@{domain}"] if last and fi else [] ),# f.last@domain
+        *( [f"{first}.{last}@{domain}"] if last else [] ),    # first.last@domain
+        *( [f"{first}.{li}@{domain}"] if li else [] ),        # first.l@domain
+        *( [f"{first}{last}@{domain}"] if last else [] ),     # firstlast@domain
+        *( [f"{last}{first}@{domain}"] if last else [] ),     # lastfirst@domain
+        *( [f"{fi}{li}@{domain}"] if fi and li else [] ),     # fl@domain
     ]
 
-    # remove duplicates, keep order
-    return list(dict.fromkeys([p for p in patterns if "@" in p]))
+    # De-duplicate while preserving order
+    seen = set()
+    ordered = []
+    for p in patterns:
+        if p not in seen:
+            seen.add(p)
+            ordered.append(p)
+    return ordered
+
 
 # ---------------------------
 # Routes
 # ---------------------------
 @app.get("/")
 def home():
-    return {
-        "message": "🚀 Email Finder API is Live!",
-        "endpoint": "/find",
-        "example": {
-            "full_name": "John Doe",
-            "domain": "example.com"
-        }
-    }
+    return {"message": "🚀 Email Finder API is Live!", "endpoints": ["/find"]}
+
 
 @app.post("/find", response_model=FindResponse)
 async def find_email(req: FindRequest):
-    """
-    Generate email patterns, verify each one sequentially,
-    and return the first valid (deliverable) email found.
-    """
-    full_name = req.full_name.strip()
-    domain = req.domain.strip()
+    full_name = (req.full_name or "").strip()
+    domain = clean_domain(req.domain)
 
-    if not full_name or not domain:
-        raise HTTPException(status_code=400, detail="Full name and domain are required")
-
-    # Generate patterns
     patterns = generate_patterns(full_name, domain)
     if not patterns:
-        raise HTTPException(status_code=400, detail="Could not generate email patterns")
+        raise HTTPException(status_code=400, detail="Could not generate email patterns (need at least a first name).")
 
-    logger.info(f"Generated {len(patterns)} patterns for '{full_name}' @ '{domain}'")
+    logger.info(f"Trying {len(patterns)} pattern(s) for '{full_name}' @ {domain}: {patterns}")
 
-    # Verify each pattern until a valid one is found
     for email in patterns:
-        logger.info(f"Verifying {email}")
-        result = await asyncio.to_thread(verify_email, email)
+        try:
+            result = await asyncio.to_thread(verify_email, email)
+        except Exception as e:
+            logger.error(f"Verifier error for {email}: {e}")
+            # continue to next pattern on transient errors
+            continue
 
-        if result.get("Deliverable") and result.get("Status") == "valid":
-            logger.info(f"✅ Found valid email: {email}")
+        if result and result.get("Deliverable") and result.get("Status") == "valid":
+            logger.info(f"FOUND valid email: {email}")
             return {"found": email}
 
-    # If none are valid
-    logger.info("❌ No valid email found")
+    # none validated as deliverable
     return {"found": None}
