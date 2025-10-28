@@ -8,10 +8,10 @@ import asyncio, re, logging
 app = FastAPI(
     title="Email Finder",
     version="1.0",
-    description="Generates possible email patterns and verifies them using SMTP logic."
+    description="Generates specific email patterns and verifies them using SMTP logic."
 )
 
-# Logging
+# Logging setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,7 @@ class FindResponse(BaseModel):
 # Helper to generate email patterns
 # ---------------------------
 def generate_patterns(full_name: str, domain: str) -> List[str]:
+    """Generate specific email patterns in the desired order."""
     full_name = re.sub(r"[^a-zA-Z\s]", "", full_name).lower().strip()
     parts = full_name.split()
     if not parts:
@@ -37,21 +38,22 @@ def generate_patterns(full_name: str, domain: str) -> List[str]:
 
     first = parts[0]
     last = parts[-1] if len(parts) > 1 else ""
-    fi, li = first[0], (last[0] if last else "")
+    fi = first[0] if first else ""
+    li = last[0] if last else ""
 
     patterns = [
-        f"{first}@{domain}",
-        f"{first}{last}@{domain}",
-        f"{first}.{last}@{domain}",
-        f"{fi}{last}@{domain}",
-        f"{first}{li}@{domain}",
-        f"{last}.{first}@{domain}",
-        f"{last}{first}@{domain}",
-        f"{fi}.{last}@{domain}",
-        f"{first}_{last}@{domain}",
-        f"{last}@{domain}",
+        f"{first}@{domain}",           # first
+        f"{last}@{domain}",            # last
+        f"{fi}.{last}@{domain}",       # f.last
+        f"{first}.{last}@{domain}",    # first.last
+        f"{first}.{li}@{domain}",      # first.l
+        f"{first}{last}@{domain}",     # firstlast
+        f"{last}{first}@{domain}",     # lastfirst
+        f"{fi}{li}@{domain}",          # fl
     ]
-    return list(dict.fromkeys(patterns))  # remove duplicates
+
+    # Remove duplicates, keep order
+    return list(dict.fromkeys([p for p in patterns if "@" in p]))
 
 # ---------------------------
 # Routes
@@ -85,6 +87,6 @@ async def find_email(req: FindRequest):
 
         if result.get("Deliverable") and result.get("Status") == "valid":
             found = email
-            break
+            break  # stop after finding a valid one
 
     return {"found": found, "attempts": attempts}
